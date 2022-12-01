@@ -1,0 +1,112 @@
+#!/bin/bash
+
+echo " "
+echo "                     .:odxxddl:,.                "
+echo "                   'lxOkol::;;,,,'.              " 
+echo "                ,xXWKOkOKXXXX0xl;.               "
+echo "              .dNMMMMMWXOdooooddxdc;.            "
+echo "             ,OWMMWXkl;.           ..            "
+echo "            cXMWKd:.                             "
+echo "          .oNMWk'                         ..     "
+echo "         .dNMWx.                          'd:    "
+echo "        .xWMWx.                           .xK;   "
+echo "       .dWMWk.                             dW0,  "
+echo "       :XMMK;   .                     .    dWMO  "
+echo "       :XMM0'  .oo'....';:;,'.......'c;   .xMWk  "
+echo "       .oNMX;  .dNNK0KXNWMk:'...'',,...   ,KMO'  "
+echo "        .oNWd.  'OWMMMMMMMx,.            .dWO'   "
+echo "          cKK;   ,0MMMMMMMx,.            cKk'    "
+echo "           ,Ox'   ;0MMMMMMx,.          .:Od.     "
+echo "            .okd,  ;KMMMMMx'.        .oOkc       "
+echo "              :O0:  ,xKWMWd..       .xKx'        "
+echo "               .ckl.  .,:c'        ,xx,          "
+echo "                 .::.            .;c,            "
+echo "                                                 "
+echo " breach (Reverse-) VPN                           "
+echo " by breachr                                      "
+
+# TODO: Further limit victim traffic inside bvpn
+# TODO: Isolated Traffic > setup multiple push routes
+# TODO: Update Certs > breachVPN_VICTIM :-/
+
+set -e
+CWDIR=$(pwd)
+
+if [ $USER != "root" ]; then
+    echo "This must be run as root."
+    exit 1
+fi
+
+### VARS
+SRVIP="37.221.193.73"                       # VPN Server IP (Breachbox / Zombie)
+VPNSUB="10.69.69.0 255.255.255.0"           # VPN Subnet
+SRVPORT="1194"                              # VPN Server Port (! FW? !)
+SRVPROT="udp"                               # VPN Server Protocol
+PUSHGW=true                                 # Push Everything through VPN
+                                            # If disabled: ALL routes must be set manually!
+
+BVPNIF="tun0"                                   # On which IF is bvpn? (Should be tun0)
+SRVIFS=("eth0" "eth1" "tun1" "tun2" "tun3")     # Server IFs (must not exist)   
+# Server Subnets to push (required if PUSHGW false):
+SRVSUBS=('172.0.0.0 255.0.0.0' '10.0.0.0 255.0.0.0' '192.168.0.0 255.255.0.0')
+# ? Victim Subnets to push (! check for conflict with SRVSUBS !):
+VICSUBS=('10.16.147.0 255.255.255.0' '172.19.147.0 255.255.255.0')  
+
+### SRVCFG
+SRVCFG="$CWDIR/bvpn_SERVER.ovpn"
+sed -i "/^server /c\server $VPNSUB" $SRVCFG                    # Server IP
+sed -i "/^port /c\port $SRVPORT" $SRVCFG                       # Server IP
+sed -i "/^proto /c\proto $SRVPROT" $SRVCFG                     # Protocol
+sed -i "/^ifconfig-pool-persist /c\ifconfig-pool-persist $CWDIR/bvpn-ipp.txt" $SRVCFG # IPP
+sed -i '/^route /d' $SRVCFG && sed -i '/^push "route /d' $SRVCFG
+for ((i = 0; i < ${#VICSUBS[@]}; i++)); do
+    # ! THIS MAY BE WRONG !:
+    echo -e "route ${VICSUBS[$i]}\n$(cat $SRVCFG)" > $SRVCFG
+    echo -e "push \"route ${VICSUBS[$i]}\"\n$(cat $SRVCFG)" > $SRVCFG
+done
+for ((i = 0; i < ${#SRVSUBS[@]}; i++)); do
+    echo -e "route ${SRVSUBS[$i]}\n$(cat $SRVCFG)" > $SRVCFG
+    echo -e "push \"route ${SRVSUBS[$i]}\"\n$(cat $SRVCFG)" > $SRVCFG
+done
+
+if [ "$PUSHGW" = true ] ; then
+    sed -i "/push \"redirect-gateway/c\push \"redirect-gateway def1\"" $SRVCFG
+else
+    sed -i "/push \"redirect-gateway/c\# push \"redirect-gateway def1\"" $SRVCFG
+fi 
+
+### Update Client Configs
+sed -i "/^remote /c\remote $SRVIP $SRVPORT" bvpn_BREACH1.ovpn bvpn_BREACH2.ovpn bvpn_VICTIM.ovpn
+sed -i "/^proto /c\proto $SRVPROT" bvpn_BREACH1.ovpn bvpn_BREACH2.ovpn bvpn_VICTIM.ovpn
+
+### Update VICTIM Subnets
+CCDIR="$CWDIR/ccd/"
+mkdir -p $CCDIR && touch /breachVPN_VICTIM && echo "" > $CCDIR/breachVPN_VICTIM # TODO: Update Cert!
+sed -i "/^client-config-dir /c\client-config-dir $CCDIR" $SRVCFG # Server Entry
+for ((i = 0; i < ${#VICSUBS[@]}; i++)); do
+    echo -e "iroute ${VICSUBS[$i]}\n$(cat $CCDIR/breachVPN_VICTIM)" > $CCDIR/breachVPN_VICTIM
+    echo -e "iroute ${VICSUBS[$i]}\n$(cat $CCDIR/bvpn_VICTIM)" > $CCDIR/bvpn_VICTIM
+done
+
+### Set IPTables and IPForward
+sysctl net.ipv4.ip_forward=1 && sysctl -p
+iptables -t nat -I POSTROUTING 1 -s 10.69.69.0/24 -j MASQUERADE     # NAT EVERYTHING from bvpn
+iptables -A FORWARD -j ACCEPT                                       # Allow FORWARDING for ALL
+iptables -L -t nat
+
+function shutdown {
+    echo "Removing rules and shutting down!"
+    iptables -F
+    iptables -t nat -F
+    iptables -X
+    iptables -nvL
+}
+trap shutdown EXIT
+
+### RUN
+echo "bvpn_CLIENT.ovpn only needs to be updated on Server IP Change!"
+echo "To avoid disconnect > start local VPNs with:"
+echo "Remove "redirect gateway" from .ovpns! If still disconnected try:"
+echo "openvpn --pull-filter ignore redirect-gateway <.OVPN>"
+sleep 3
+openvpn $SRVCFG
